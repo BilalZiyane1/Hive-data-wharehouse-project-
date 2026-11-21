@@ -1,0 +1,4 @@
+Apache Spark is a distributed processing engine.
+Apache Hadoop provides distributed storage.
+Spark and Hadoop work together for big data.
+Spark supports Python SQL and streaming.

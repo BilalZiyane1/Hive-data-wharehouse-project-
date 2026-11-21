@@ -1,0 +1,558 @@
+# Lightweight HDFS/Spark warehouse stack for an 8 GB development machine.
+# The default profile uses 1 NameNode, 1 DataNode, 1 Spark worker, PostgreSQL,
+# Kafka, Hive and Spark jobs. Use --profile full only for the 3-DataNode/YARN lab.
+#
+#   podman compose up -d --build     # first run builds the Hadoop image
+#   podman compose ps
+#   podman compose down -v           # stop AND wipe HDFS (volumes)
+name: hdfs
+
+x-hadoop: &hadoop
+  image: bigdata/hadoop:3.4.3
+  restart: "no"
+  # Same config on every daemon; students edit ./conf/*.xml and restart.
+  volumes: &common-volumes
+    - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro,z
+    - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:ro,z
+    - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:ro,z
+    - ./datasets:/datasets:z
+
+x-datanode-env: &dn-env
+  HDFS_DATANODE_OPTS: "-Xmx160m"
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    hostname: postgres
+    environment:
+      POSTGRES_DB: realtime_warehouse
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: warehouse_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouse -d realtime_warehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - shared-network
+
+  postgres-bootstrap:
+    image: docker.io/library/postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: warehouse_dev
+    command: >
+      sh -c "psql -v ON_ERROR_STOP=1 -h postgres -U warehouse
+      -d realtime_warehouse -f /schema/init.sql"
+    volumes:
+      - ./postgres/init.sql:/schema/init.sql:ro,z
+    restart: "no"
+    networks:
+      - shared-network
+
+  # Hive's catalog is stored separately from the operational warehouse data.
+  # The embedded Derby catalog is suitable for this single-user course stack.
+  hive-metastore:
+    profiles: ["hive", "reporting"]
+    image: docker.io/apache/hive:4.0.1
+    hostname: hive-metastore
+    # The named Derby volume is writable by root in this rootless dev stack.
+    user: "0:0"
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: derby
+      SERVICE_OPTS: "-Xmx384m"
+      HADOOP_CLASSPATH: /opt/hadoop/share/hadoop/tools/lib/*
+    ports:
+      - "9083:9083"
+    volumes:
+      - hive_metastore_data:/opt/hive/data
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro,z
+      - ./hadoop/conf/core-site.xml:/opt/hive/conf/core-site.xml:ro,z
+      - ./hadoop/conf/hdfs-site.xml:/opt/hive/conf/hdfs-site.xml:ro,z
+      - ./conf/mapred-site.xml:/opt/hive/conf/mapred-site.xml:ro,z
+      - ./conf/yarn-site.xml:/opt/hive/conf/yarn-site.xml:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - shared-network
+
+  hiveserver2:
+    profiles: ["hive", "reporting"]
+    image: docker.io/apache/hive:4.0.1
+    hostname: hiveserver2
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: hiveserver2
+      SERVICE_OPTS: "-Xmx512m"
+      IS_RESUME: "true"
+      HADOOP_CLASSPATH: /opt/hadoop/share/hadoop/tools/lib/*
+    ports:
+      - "10000:10000"
+      - "10002:10002"
+    volumes:
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro,z
+      - ./hive/demo_queries.sql:/tmp/demo_queries.sql:ro,z
+      - ./hive/warehouse_tables.sql:/tmp/warehouse_tables.sql:ro,z
+      - ./hive/refresh_partitions.sql:/tmp/refresh_partitions.sql:ro,z
+      - ./hadoop/conf/core-site.xml:/opt/hive/conf/core-site.xml:ro,z
+      - ./hadoop/conf/hdfs-site.xml:/opt/hive/conf/hdfs-site.xml:ro,z
+      - ./conf/mapred-site.xml:/opt/hive/conf/mapred-site.xml:ro,z
+      - ./conf/yarn-site.xml:/opt/hive/conf/yarn-site.xml:ro,z
+      - ./runtime/hive-mapred:/tmp/hive-mapred-local:Z
+      - ./runtime/hadoop-hive:/tmp/hadoop-hive:Z
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/10000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    restart: "no"
+    networks:
+      - shared-network
+
+  hive-warehouse-init:
+    profiles: ["hive", "reporting"]
+    image: docker.io/apache/hive:4.0.1
+    depends_on:
+      hiveserver2:
+        condition: service_healthy
+    environment:
+      HADOOP_CLASSPATH: /opt/hadoop/share/hadoop/tools/lib/*
+    entrypoint: ["/bin/bash", "-lc"]
+    command: ["/opt/hive/bin/beeline -u 'jdbc:hive2://hiveserver2:10000/default' -f /scripts/warehouse_tables.sql"]
+    volumes:
+      - ./hive/warehouse_tables.sql:/scripts/warehouse_tables.sql:ro,z
+      - ./hive/demo_queries.sql:/scripts/demo_queries.sql:ro,z
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro,z
+      - ./hadoop/conf/core-site.xml:/opt/hive/conf/core-site.xml:ro,z
+      - ./hadoop/conf/hdfs-site.xml:/opt/hive/conf/hdfs-site.xml:ro,z
+      - ./conf/mapred-site.xml:/opt/hive/conf/mapred-site.xml:ro,z
+      - ./conf/yarn-site.xml:/opt/hive/conf/yarn-site.xml:ro,z
+    restart: "no"
+    networks:
+      - shared-network
+
+  hive-partition-refresh:
+    profiles: ["hive", "reporting"]
+    image: docker.io/apache/hive:4.0.1
+    depends_on:
+      hiveserver2:
+        condition: service_healthy
+    environment:
+      HADOOP_CLASSPATH: /opt/hadoop/share/hadoop/tools/lib/*
+    entrypoint: ["/bin/bash", "-lc"]
+    command: ["/opt/hive/bin/beeline -u 'jdbc:hive2://hiveserver2:10000/default' -f /scripts/refresh_partitions.sql"]
+    volumes:
+      - ./hive/refresh_partitions.sql:/scripts/refresh_partitions.sql:ro,z
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro,z
+      - ./hadoop/conf/core-site.xml:/opt/hive/conf/core-site.xml:ro,z
+      - ./hadoop/conf/hdfs-site.xml:/opt/hive/conf/hdfs-site.xml:ro,z
+      - ./conf/mapred-site.xml:/opt/hive/conf/mapred-site.xml:ro,z
+      - ./conf/yarn-site.xml:/opt/hive/conf/yarn-site.xml:ro,z
+    restart: "no"
+    networks:
+      - shared-network
+
+  transaction-producer:
+    profiles: ["demo"]
+    build: ./producer
+    depends_on:
+      postgres-bootstrap:
+        condition: service_completed_successfully
+      broker:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_DSN: host=postgres port=5432 dbname=realtime_warehouse user=warehouse password=warehouse_dev
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
+    volumes:
+      - ./app:/app:ro,z
+    command: ["python", "kafka_producer.py"]
+    restart: unless-stopped
+    networks:
+      - shared-network
+
+  warehouse-loader:
+    profiles: ["batch"]
+    image: docker.io/apache/spark:4.0.1
+    depends_on:
+      postgres-bootstrap:
+        condition: service_completed_successfully
+      namenode:
+        condition: service_started
+      spark-master:
+        condition: service_started
+    command: >
+      /bin/bash -c "while true; do
+      /opt/spark/bin/spark-submit
+      --packages org.postgresql:postgresql:42.7.5
+      --conf spark.jars.ivy=/tmp/.ivy2
+      --master spark://spark-master:7077
+      /app/postgres_to_hdfs.py || echo 'Warehouse load failed; retrying in 60 seconds';
+      sleep 60;
+      done"
+    volumes:
+      - ./app:/app:ro,z
+    restart: unless-stopped
+    networks:
+      - shared-network
+
+  streaming-enricher:
+    profiles: ["streaming"]
+    image: docker.io/apache/spark:4.0.1
+    depends_on:
+      broker:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      namenode:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    command: >
+      /opt/spark/bin/spark-submit
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1
+      --conf spark.jars.ivy=/tmp/.ivy2
+      --master spark://spark-master:7077
+      /app/spark_rtm_pipeline.py
+    volumes:
+      - ./app:/app:ro,z
+      - ./data:/data:ro,z
+    restart: unless-stopped
+    networks:
+      - shared-network
+
+  namenode:
+    <<: *hadoop
+    build: ./hadoop           # build once; all Hadoop daemons use this image
+    hostname: namenode
+    command: ["namenode"]
+    environment:
+      HDFS_NAMENODE_OPTS: "-Xmx384m"
+    ports:
+      - "9870:9870"   # NameNode web UI
+      - "8020:8020"   # HDFS RPC (optional, for host clients)
+    volumes:
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro,z
+      - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:ro,z
+      - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:ro,z
+      - ./datasets:/datasets:z
+      - namenode:/hadoop/dfs/name
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9870/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks:
+      - shared-network
+
+  datanode1:
+    <<: *hadoop
+    hostname: datanode1
+    command: ["datanode"]
+    environment: *dn-env
+    volumes:
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro,z
+      - ./datasets:/datasets:z
+      - datanode1:/hadoop/dfs/data
+    networks:
+      - shared-network
+
+
+  datanode2:
+    profiles: ["full"]
+    <<: *hadoop
+    hostname: datanode2
+    command: ["datanode"]
+    environment: *dn-env
+    volumes:
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro,z
+      - ./datasets:/datasets:z
+      - datanode2:/hadoop/dfs/data
+    networks:
+      - shared-network
+
+
+  datanode3:
+    profiles: ["full"]
+    <<: *hadoop
+    hostname: datanode3
+    command: ["datanode"]
+    environment: *dn-env
+    volumes:
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro,z
+      - ./datasets:/datasets:z
+      - datanode3:/hadoop/dfs/data
+    networks:
+      - shared-network
+
+  resourcemanager:
+    profiles: ["full"]
+    <<: *hadoop
+    hostname: resourcemanager
+    command: ["resourcemanager"]
+    environment:
+      YARN_RESOURCEMANAGER_OPTS: "-Xmx384m"
+    ports:
+      - "8088:8088"   # YARN ResourceManager web UI
+    networks:
+      - shared-network
+
+  nodemanager:
+    profiles: ["full"]
+    <<: *hadoop
+    hostname: nodemanager
+    command: ["nodemanager"]
+    environment:
+      YARN_NODEMANAGER_OPTS: "-Xmx256m"
+    ports:
+      - "8042:8042"   # NodeManager web UI (container logs)
+    networks:
+      - shared-network
+
+
+  historyserver:
+    profiles: ["full"]
+    <<: *hadoop
+    hostname: historyserver
+    command: ["historyserver"]
+    environment:
+      MAPRED_HISTORYSERVER_OPTS: "-Xmx192m"
+    ports:
+      - "19888:19888" # MapReduce JobHistory web UI
+    networks:
+      - shared-network
+
+  spark-master:
+    image: docker.io/apache/spark:4.0.1
+    hostname: spark-master
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.master.Master
+    depends_on:
+      postgres-bootstrap:
+        condition: service_completed_successfully
+    networks:
+      - shared-network
+    environment:
+      SPARK_WORKER_CORES: 1
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_DAEMON_MEMORY: 384m
+    ports:
+      - "8086:8080"
+      - "7077:7077"
+      - "4041:4040"
+    volumes:
+      - ./app:/app:z
+      - ./data:/data:z
+      - ./conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro,z
+  spark-worker-a:
+    image: docker.io/apache/spark:4.0.1
+    hostname: spark-worker-a
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077
+    depends_on:
+      - spark-master
+    ports:
+      - "8081:8081"
+    networks:
+      - shared-network
+    environment:
+      SPARK_WORKER_CORES: 1
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_DAEMON_MEMORY: 384m
+    volumes:
+      - ./app:/app:z
+      - ./data:/data:z
+      - ./conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro,z
+
+
+  spark-worker-b:
+    profiles: ["full"]
+    image: docker.io/apache/spark:4.0.1
+    hostname: spark-worker-b
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077
+    depends_on:
+      - spark-master
+    ports:
+      - "8082:8081"
+    networks:
+      - shared-network
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+    volumes:
+      - ./app:/app:z
+      - ./data:/data:z
+      - ./conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro,z
+
+  jupyter-local:
+    profiles: ["reporting"]
+    build: ./spark
+    command: python3 -m jupyterlab --allow-root --ip=0.0.0.0 --no-browser --ServerApp.token=''
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - ./app:/app:z
+      - ./data:/data:z
+    networks:
+      - shared-network
+
+  broker:
+    image: docker.io/apache/kafka:4.0.0
+    hostname: broker
+
+    ports:
+      - "9092:9092"
+
+    environment:
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx384m"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+    networks:
+      - shared-network
+
+  kafka-init:
+    profiles: ["demo", "streaming"]
+    image: docker.io/apache/kafka:4.0.0
+    depends_on:
+      broker:
+        condition: service_started
+    command: >
+      /bin/bash -lc "
+      /opt/kafka/bin/kafka-topics.sh
+      --bootstrap-server broker:29092
+      --create --if-not-exists
+      --topic transactions_topic
+      --partitions 3
+      --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh
+      --bootstrap-server broker:29092
+      --create --if-not-exists
+      --topic enriched_transactions_topic
+      --partitions 3
+      --replication-factor 1"
+    restart: "no"
+    networks:
+      - shared-network
+
+  kafka-ui:
+    profiles: ["reporting"]
+    image: ghcr.io/kafbat/kafka-ui:v1.3.0
+    depends_on:
+      - broker
+    ports:
+      - "9000:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks:
+      - shared-network
+
+  superset:
+    profiles: ["reporting"]
+    image: localhost/realtime-superset:5.0.0
+    build: ./superset
+    hostname: superset
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY: local-only-change-this-superset-secret
+      SUPERSET_ADMIN_USERNAME: admin
+      SUPERSET_ADMIN_PASSWORD: admin
+      SUPERSET_ADMIN_EMAIL: admin@example.local
+    command: >
+      /bin/sh -c "superset db upgrade &&
+      (superset fab create-admin --username \"$$SUPERSET_ADMIN_USERNAME\"
+      --firstname Admin --lastname User --email \"$$SUPERSET_ADMIN_EMAIL\"
+      --password \"$$SUPERSET_ADMIN_PASSWORD\" || true) &&
+      superset init &&
+      superset run -h 0.0.0.0 -p 8088 --with-threads"
+    ports:
+      - "8089:8088"
+    volumes:
+      - superset_home:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro,z
+    networks:
+      - shared-network
+
+  streamlit:
+    profiles: ["dashboard"]
+    build: ./dashboard
+    hostname: streamlit
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: realtime_warehouse
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: warehouse_dev
+    ports:
+      - "8501:8501"
+    networks:
+      - shared-network
+
+volumes:
+  namenode:
+  datanode1:
+  datanode2:
+  datanode3:
+  spark-inputs:
+  postgres_data:
+  superset_home:
+  hive_metastore_data:
+
+networks:
+  shared-network:
+    driver: bridge

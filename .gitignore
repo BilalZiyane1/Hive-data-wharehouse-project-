@@ -1,0 +1,25 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# LaTeX intermediate files
+report/build/
+
+# Local HDFS and Hive scratch data
+infra/hdfs/runtime/*
+
+# Reference report used during development, not part of this project
+Rapport_Entrepot_Temps_Reel.pdf
